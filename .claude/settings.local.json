@@ -6,7 +6,8 @@
       "Bash(conda create:*)",
       "Bash(source:*)",
       "Bash(conda activate:*)",
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "Bash(python -c:*)"
     ],
     "deny": [],
     "ask": []
