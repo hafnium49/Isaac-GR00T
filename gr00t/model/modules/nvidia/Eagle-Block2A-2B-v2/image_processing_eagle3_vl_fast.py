@@ -138,6 +138,61 @@ class Eagle3_VLImageProcessorFast(BaseImageProcessorFast):
         """
         return make_flat_list_of_images(images)
 
+    def _prepare_input_images(
+        self,
+        images: ImageInput,
+        do_convert_rgb: Optional[bool] = None,
+        input_data_format: Optional[Union[str, ChannelDimension]] = None,
+        device: Optional["torch.device"] = None,
+    ) -> List["torch.Tensor"]:
+        """
+        Prepare the input images for processing.
+
+        This method is a compatibility shim for older transformers versions that
+        don't have this method in BaseImageProcessorFast.
+        """
+        from functools import partial
+
+        images = self._prepare_images_structure(images)
+
+        # Check if parent has _process_image method
+        if hasattr(super(), '_process_image'):
+            process_image_fn = partial(
+                super()._process_image,
+                do_convert_rgb=do_convert_rgb,
+                input_data_format=input_data_format,
+                device=device,
+            )
+            processed_images = []
+            for image in images:
+                processed_images.append(process_image_fn(image))
+            return processed_images
+        else:
+            # Fallback: minimal processing for compatibility
+            processed_images = []
+            for image in images:
+                # Convert to tensor if needed
+                if not isinstance(image, torch.Tensor):
+                    # Handle PIL images
+                    if hasattr(image, 'convert'):
+                        if do_convert_rgb:
+                            image = image.convert('RGB')
+                        # Convert PIL to tensor
+                        image = F.to_tensor(image)
+                    else:
+                        # Handle numpy arrays
+                        image = torch.from_numpy(image)
+                        if image.ndim == 3 and image.shape[-1] in (1, 3, 4):
+                            image = image.permute(2, 0, 1)  # HWC -> CHW
+
+                # Move to device if specified
+                if device is not None:
+                    image = image.to(device)
+
+                processed_images.append(image)
+
+            return processed_images
+
     def _preprocess(
         self,
         images: List["torch.Tensor"],

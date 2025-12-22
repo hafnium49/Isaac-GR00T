@@ -117,7 +117,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         dataset_path: str | Path,
         embodiment_tag: EmbodimentTag,
         modality_configs: dict[str, ModalityConfig],
-        video_backend: str = "torchcodec",
+        video_backend: str = "ffmpeg",  # Changed from torchcodec for ARM64/GX10 compatibility
         video_backend_kwargs: dict[str, Any] | None = None,
         shard_size: int = 2**10,  # 1024 steps
         episode_sampling_rate: float = 0.1,

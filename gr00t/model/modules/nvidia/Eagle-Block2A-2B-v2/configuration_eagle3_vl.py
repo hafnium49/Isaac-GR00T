@@ -71,6 +71,8 @@ class Eagle3_VLConfig(PretrainedConfig):
         self.loss_version = loss_version
         self.tie_word_embeddings = self.text_config.tie_word_embeddings
         self.image_token_index = image_token_index
+        # Compatibility: add initializer_range for _init_weights in modeling_eagle3_vl.py
+        self.initializer_range = kwargs.get('initializer_range', 0.02)
 
     def to_dict(self):
         """

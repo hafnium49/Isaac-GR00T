@@ -77,4 +77,5 @@ class DataConfig:
     # DP Image Config
     image_crop_size: List[int] = field(default_factory=lambda: [244, 244])
     image_target_size: List[int] = field(default_factory=lambda: [224, 224])
-    video_backend: str = "torchcodec"
+    # Use ffmpeg on ARM64/GX10 since torchcodec is not available
+    video_backend: str = "ffmpeg"

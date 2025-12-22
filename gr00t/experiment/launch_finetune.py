@@ -88,5 +88,22 @@ if __name__ == "__main__":
     config.data.shard_size = ft_config.shard_size
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
+    config.data.video_backend = ft_config.video_backend
 
-    run(config)
+    # Handle cached features mode
+    if ft_config.use_cached_features:
+        if not ft_config.cached_features_path:
+            raise ValueError("cached_features_path is required when use_cached_features=True")
+
+        print(f"Using cached features from: {ft_config.cached_features_path}")
+        print("Note: Backbone will be skipped during training")
+
+        # Use the cached training script instead
+        from gr00t.experiment.train_cached import run_cached_training
+        run_cached_training(
+            config=config,
+            cached_features_path=ft_config.cached_features_path,
+            ft_config=ft_config,
+        )
+    else:
+        run(config)

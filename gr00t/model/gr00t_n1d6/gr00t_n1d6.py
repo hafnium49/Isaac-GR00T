@@ -81,7 +81,9 @@ class Gr00tN1d6ActionHead(nn.Module):
         # State noise parameters
         self.state_additive_noise_scale = config.state_additive_noise_scale
 
-        self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
+        # Lazy init: store raw values to avoid meta tensor crash during init_empty_weights()
+        self.noise_alpha = float(config.noise_beta_alpha)
+        self.noise_beta = float(config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
         self.set_trainable_parameters(
             config.tune_projector, config.tune_diffusion_model, config.tune_vlln
@@ -135,7 +137,11 @@ class Gr00tN1d6ActionHead(nn.Module):
                 self.model.eval()
 
     def sample_time(self, batch_size, device, dtype):
-        sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
+        # Create Beta distribution on correct device (avoids meta tensor issue)
+        alpha = torch.tensor(self.noise_alpha, device=device, dtype=dtype)
+        beta_val = torch.tensor(self.noise_beta, device=device, dtype=dtype)
+        beta_dist = Beta(alpha, beta_val)
+        sample = beta_dist.sample([batch_size])
         sample = (1 - sample) * self.config.noise_s
         return sample
 
@@ -414,6 +420,17 @@ class Gr00tN1d6(PreTrainedModel):
     config_class = Gr00tN1d6Config
     supports_gradient_checkpointing = True
 
+    @property
+    def all_tied_weights_keys(self):
+        """Compatibility property for older transformers versions.
+
+        Older transformers versions use `all_tied_weights_keys` while newer ones
+        use `_tied_weights_keys`. This provides compatibility.
+        """
+        if hasattr(self, '_tied_weights_keys') and self._tied_weights_keys:
+            return {k: None for k in self._tied_weights_keys}
+        return {}
+
     def __init__(
         self,
         config: Gr00tN1d6Config,
@@ -501,13 +518,35 @@ class Gr00tN1d6(PreTrainedModel):
             inputs: Dictionary containing:
                 - Eagle inputs (prefixed with 'eagle_')
                 - Action inputs (state, action, embodiment_id, etc.)
+                - Optionally: cached_features, attention_mask, image_mask
+                  (pre-computed backbone features for cached training)
 
         Returns:
             BatchFeature containing loss and other outputs
         """
-        # Prepare inputs for backbone and action head
-        backbone_inputs, action_inputs = self.prepare_input(inputs)
-        backbone_outputs = self.backbone(backbone_inputs)
+        # Check if using cached features (skip backbone)
+        if "cached_features" in inputs:
+            # Use pre-computed backbone features
+            backbone_outputs = BatchFeature(data={
+                "backbone_features": inputs["cached_features"].to(self.device, dtype=self.dtype),
+                "backbone_attention_mask": inputs["attention_mask"].to(self.device),
+                "image_mask": inputs["image_mask"].to(self.device),
+            })
+            # Prepare action inputs only
+            action_inputs = self.action_head.prepare_input(inputs)
+
+            def to_device_with_dtype(x):
+                if torch.is_floating_point(x):
+                    return x.to(self.device, dtype=self.dtype)
+                else:
+                    return x.to(self.device)
+
+            action_inputs = tree.map_structure(to_device_with_dtype, action_inputs)
+        else:
+            # Standard forward: prepare inputs for backbone and action head
+            backbone_inputs, action_inputs = self.prepare_input(inputs)
+            backbone_outputs = self.backbone(backbone_inputs)
+
         action_outputs = self.action_head(backbone_outputs, action_inputs)
 
         return action_outputs

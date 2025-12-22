@@ -289,6 +289,51 @@ def get_frames_by_indices(
         cap.release()
         frames = np.array(frames)
         return frames
+    elif video_backend == "preextracted":
+        # Load pre-extracted frames from .pt files
+        # Expected path format: /path/to/dataset/videos/observation.images.top/episode_000000.mp4
+        # Converts to: /path/to/dataset/frames/observation/images/top/episode_000000.pt
+        import torch
+        from pathlib import Path
+
+        video_path_obj = Path(video_path)
+        dataset_dir = video_path_obj.parent.parent  # Go up from videos/key/ to dataset root
+
+        # Handle different directory structures
+        if "videos" in video_path_obj.parts:
+            videos_idx = video_path_obj.parts.index("videos")
+            dataset_dir = Path(*video_path_obj.parts[:videos_idx])
+            # Get video key from remaining path (e.g., "observation.images.top")
+            remaining_parts = video_path_obj.parts[videos_idx + 1:-1]  # Exclude filename
+            video_key = ".".join(remaining_parts) if len(remaining_parts) > 1 else remaining_parts[0]
+        else:
+            # Fallback: assume parent is the video key directory
+            video_key = video_path_obj.parent.name
+
+        # Convert video key to directory path (observation.images.top -> observation/images/top)
+        key_path = video_key.replace(".", "/")
+        episode_id = video_path_obj.stem  # e.g., episode_000000
+
+        # Construct tensor path
+        tensor_path = dataset_dir / "frames" / key_path / f"{episode_id}.pt"
+
+        if not tensor_path.exists():
+            raise FileNotFoundError(
+                f"Pre-extracted frames not found: {tensor_path}\n"
+                f"Run preprocess_video_frames.py to extract frames first."
+            )
+
+        # Load tensor data
+        data = torch.load(tensor_path, map_location="cpu", weights_only=False)
+        frames_tensor = data["frames"]  # [T, C, H, W] float32 in [0, 1]
+
+        # Convert to numpy and select requested indices
+        # GR00T expects [N, H, W, C] uint8
+        frames_tensor = frames_tensor[list(indices)]  # Select frames
+        frames_tensor = frames_tensor.permute(0, 2, 3, 1)  # NCHW -> NHWC
+        frames_tensor = (frames_tensor * 255).to(torch.uint8)  # [0,1] -> [0,255]
+
+        return frames_tensor.numpy()
     else:
         raise NotImplementedError
 

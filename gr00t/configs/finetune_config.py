@@ -116,3 +116,17 @@ class FinetuneConfig:
 
     num_shards_per_epoch: int = int(1e5)
     """Number of shards to use for the dataset. reduce this number if vram is limited."""
+
+    video_backend: str = "ffmpeg"
+    """Video backend for loading frames. Options: "ffmpeg", "decord", "torchcodec", "opencv", "preextracted".
+    Use "preextracted" for pre-extracted frame tensors (eliminates video decoding overhead)."""
+
+    # --- Cached Features (Feature Dumper) ---
+    use_cached_features: bool = False
+    """Use pre-computed backbone features instead of live inference.
+    Enables >20 steps/sec throughput by skipping the Eagle backbone.
+    Features must be pre-computed using dump_features_n16.py."""
+
+    cached_features_path: str = ""
+    """Path to cached features directory (WebDataset shards or LMDB).
+    Required when use_cached_features=True."""
