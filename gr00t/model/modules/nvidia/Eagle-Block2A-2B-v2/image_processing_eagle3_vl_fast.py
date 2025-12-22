@@ -5,18 +5,42 @@
 # --------------------------------------------------------
 
 # copy from https://github.com/huggingface/transformers/blob/main/src/transformers/models/llava_onevision/image_processing_llava_onevision_fast.py
+
+# Check if fast image processing is available (requires newer transformers)
+_FAST_IMAGE_PROCESSING_AVAILABLE = False
+try:
+    from transformers.image_processing_utils_fast import (
+        BASE_IMAGE_PROCESSOR_FAST_DOCSTRING,
+        BASE_IMAGE_PROCESSOR_FAST_DOCSTRING_PREPROCESS,
+        BaseImageProcessorFast,
+        DefaultFastImageProcessorKwargs,
+        divide_to_patches,
+        group_images_by_shape,
+        reorder_images,
+    )
+    _FAST_IMAGE_PROCESSING_AVAILABLE = True
+except ImportError:
+    # Older transformers version - fast processing not available
+    # Define stub classes so the module can be imported without errors
+    BASE_IMAGE_PROCESSOR_FAST_DOCSTRING = ""
+    BASE_IMAGE_PROCESSOR_FAST_DOCSTRING_PREPROCESS = ""
+
+    # Create a fallback base class with necessary methods
+    from transformers.image_processing_utils import BaseImageProcessor
+    class BaseImageProcessorFast(BaseImageProcessor):
+        """Fallback class when fast image processing is not available."""
+        @classmethod
+        def register_for_auto_class(cls, auto_class="AutoImageProcessor"):
+            pass  # No-op for compatibility
+
+    DefaultFastImageProcessorKwargs = dict
+    divide_to_patches = None
+    group_images_by_shape = None
+    reorder_images = None
+
 from typing import List, Optional, Union
 
 from transformers.image_processing_utils import BatchFeature, get_patch_output_size, select_best_resolution
-from transformers.image_processing_utils_fast import (
-    BASE_IMAGE_PROCESSOR_FAST_DOCSTRING,
-    BASE_IMAGE_PROCESSOR_FAST_DOCSTRING_PREPROCESS,
-    BaseImageProcessorFast,
-    DefaultFastImageProcessorKwargs,
-    divide_to_patches,
-    group_images_by_shape,
-    reorder_images,
-)
 from transformers.image_utils import (
     OPENAI_CLIP_MEAN,
     OPENAI_CLIP_STD,
@@ -24,14 +48,34 @@ from transformers.image_utils import (
     IMAGENET_STANDARD_STD, # 0.5, 0.5, 0.5
     ChannelDimension,
     ImageInput,
-    VideoInput,
     PILImageResampling,
-    SizeDict,
     get_image_size,
-    make_flat_list_of_images,
-    make_batched_videos,
-    validate_kwargs
 )
+# These may not exist in older transformers versions
+try:
+    from transformers.image_utils import VideoInput
+except ImportError:
+    VideoInput = List  # Fallback type
+try:
+    from transformers.image_utils import SizeDict
+except ImportError:
+    SizeDict = dict  # Fallback type
+try:
+    from transformers.image_utils import make_flat_list_of_images
+except ImportError:
+    def make_flat_list_of_images(images):
+        if isinstance(images, list):
+            return images
+        return [images]
+try:
+    from transformers.image_utils import make_batched_videos
+except ImportError:
+    make_batched_videos = None
+try:
+    from transformers.image_utils import validate_kwargs
+except ImportError:
+    def validate_kwargs(captured_kwargs, valid_processor_keys):
+        pass  # No-op fallback
 from transformers.processing_utils import Unpack
 from transformers.utils import TensorType, add_start_docstrings, is_torch_available, is_torchvision_v2_available
 
@@ -39,11 +83,30 @@ from transformers.utils import TensorType, add_start_docstrings, is_torch_availa
 if is_torch_available():
     import torch
 if is_torchvision_v2_available():
-    from transformers.image_utils import pil_torch_interpolation_mapping
-
+    try:
+        from transformers.image_utils import pil_torch_interpolation_mapping
+    except ImportError:
+        # Fallback mapping for older transformers
+        from torchvision.transforms import InterpolationMode
+        pil_torch_interpolation_mapping = {
+            PILImageResampling.NEAREST: InterpolationMode.NEAREST,
+            PILImageResampling.BILINEAR: InterpolationMode.BILINEAR,
+            PILImageResampling.BICUBIC: InterpolationMode.BICUBIC,
+            PILImageResampling.LANCZOS: InterpolationMode.LANCZOS,
+            PILImageResampling.BOX: InterpolationMode.BOX,
+        }
     from torchvision.transforms.v2 import functional as F
 else:
     from torchvision.transforms import functional as F
+    # Define fallback mapping
+    from torchvision.transforms import InterpolationMode
+    pil_torch_interpolation_mapping = {
+        PILImageResampling.NEAREST: InterpolationMode.NEAREST,
+        PILImageResampling.BILINEAR: InterpolationMode.BILINEAR,
+        PILImageResampling.BICUBIC: InterpolationMode.BICUBIC,
+        PILImageResampling.LANCZOS: InterpolationMode.LANCZOS,
+        PILImageResampling.BOX: InterpolationMode.BOX,
+    }
 
 def crop(img: torch.Tensor, left: int, top: int, right: int, bottom: int) -> torch.Tensor:
     """Crop the given numpy array.
@@ -232,16 +295,20 @@ class Eagle3_VLImageProcessorFast(BaseImageProcessorFast):
 
 
     def preprocess(self, images: ImageInput, videos: VideoInput=None, **kwargs: Unpack[Eagle3_VLFastImageProcessorKwargs]) -> BatchFeature:
-        validate_kwargs(captured_kwargs=kwargs.keys(), valid_processor_keys=self.valid_kwargs.__annotations__.keys())
-        # Set default kwargs from self. This ensures that if a kwarg is not provided
-        # by the user, it gets its default value from the instance, or is set to None.
-        for kwarg_name in self.valid_kwargs.__annotations__:
-            kwargs.setdefault(kwarg_name, getattr(self, kwarg_name, None))
+        # When fast image processing is not available, valid_kwargs may be dict without annotations
+        valid_keys = getattr(self.valid_kwargs, '__annotations__', {}).keys() if hasattr(self.valid_kwargs, '__annotations__') else []
+        if valid_keys:
+            validate_kwargs(captured_kwargs=kwargs.keys(), valid_processor_keys=valid_keys)
+            # Set default kwargs from self. This ensures that if a kwarg is not provided
+            # by the user, it gets its default value from the instance, or is set to None.
+            for kwarg_name in valid_keys:
+                kwargs.setdefault(kwarg_name, getattr(self, kwarg_name, None))
 
         # Extract parameters that are only used for preparing the input images
-        do_convert_rgb = kwargs.pop("do_convert_rgb")
-        input_data_format = kwargs.pop("input_data_format")
-        device = kwargs.pop("device")
+        # Use get with defaults to handle missing kwargs in fallback mode
+        do_convert_rgb = kwargs.pop("do_convert_rgb", getattr(self, 'do_convert_rgb', True))
+        input_data_format = kwargs.pop("input_data_format", None)
+        device = kwargs.pop("device", None)
         # Prepare input images
         if images is not None:
             images = self._prepare_input_images(
@@ -254,23 +321,79 @@ class Eagle3_VLImageProcessorFast(BaseImageProcessorFast):
             )
 
         # Update kwargs that need further processing before being validated
-        kwargs = self._further_process_kwargs(**kwargs)
+        if hasattr(self, '_further_process_kwargs'):
+            kwargs = self._further_process_kwargs(**kwargs)
 
         # Validate kwargs
-        self._validate_preprocess_kwargs(**kwargs)
+        if hasattr(self, '_validate_preprocess_kwargs'):
+            self._validate_preprocess_kwargs(**kwargs)
 
         # torch resize uses interpolation instead of resample
-        resample = kwargs.pop("resample")
+        resample = kwargs.pop("resample", getattr(self, 'resample', PILImageResampling.BICUBIC))
         kwargs["interpolation"] = (
             pil_torch_interpolation_mapping[resample] if isinstance(resample, (PILImageResampling, int)) else resample
         )
 
-        # Pop kwargs that are not needed in _preprocess
-        kwargs.pop("default_to_square")
-        kwargs.pop("data_format")
+        # Pop kwargs that are not needed in _preprocess (use pop with None default for safety)
+        kwargs.pop("default_to_square", None)
+        kwargs.pop("data_format", None)
+
+        # In fallback mode, use simple preprocessing
+        if not _FAST_IMAGE_PROCESSING_AVAILABLE:
+            return self._preprocess_fallback(images if images is not None else videos, **kwargs)
+
         if images is not None:
             return self._preprocess(images, **kwargs)
         elif videos is not None:
             return self._preprocess(videos, **kwargs)
+
+    def _preprocess_fallback(
+        self,
+        images: List["torch.Tensor"],
+        **kwargs,
+    ) -> BatchFeature:
+        """Fallback preprocessing when fast image processing is not available."""
+        # Get processing parameters with defaults
+        do_rescale = kwargs.get("do_rescale", getattr(self, 'do_rescale', True))
+        rescale_factor = kwargs.get("rescale_factor", 1.0 / 255.0)
+        do_normalize = kwargs.get("do_normalize", getattr(self, 'do_normalize', True))
+        image_mean = kwargs.get("image_mean", getattr(self, 'image_mean', IMAGENET_STANDARD_MEAN))
+        image_std = kwargs.get("image_std", getattr(self, 'image_std', IMAGENET_STANDARD_STD))
+        return_tensors = kwargs.get("return_tensors", None)
+
+        image_sizes = []
+        processed_images = []
+
+        for image in images:
+            if not isinstance(image, torch.Tensor):
+                # Convert to tensor if needed
+                if hasattr(image, 'convert'):  # PIL image
+                    image = F.to_tensor(image)
+                else:  # numpy
+                    image = torch.from_numpy(image)
+                    if image.ndim == 3 and image.shape[-1] in (1, 3, 4):
+                        image = image.permute(2, 0, 1)  # HWC -> CHW
+
+            # Get image size (H, W)
+            image_sizes.append((image.shape[-2], image.shape[-1]))
+
+            # Rescale if needed
+            if do_rescale:
+                image = image.float() * rescale_factor
+
+            # Normalize if needed
+            if do_normalize and image_mean is not None and image_std is not None:
+                mean = torch.tensor(image_mean, dtype=image.dtype, device=image.device).view(-1, 1, 1)
+                std = torch.tensor(image_std, dtype=image.dtype, device=image.device).view(-1, 1, 1)
+                image = (image - mean) / std
+
+            processed_images.append(image)
+
+        # Stack images
+        processed_images = torch.stack(processed_images)
+
+        return BatchFeature(
+            data={"pixel_values": processed_images, "image_sizes": image_sizes}, tensor_type=return_tensors
+        )
     
 __all__ = ["Eagle3_VLImageProcessorFast"]

@@ -41,7 +41,74 @@ ISAAC_GROOT_PATH = Path(__file__).parent
 if str(ISAAC_GROOT_PATH) not in sys.path:
     sys.path.insert(0, str(ISAAC_GROOT_PATH))
 
-from gr00t.configs.data.embodiment_configs import get_embodiment_config
+
+def _patch_eagle3_vl_config():
+    """
+    Patch Eagle3_VLConfig for compatibility with newer transformers versions.
+
+    The _attn_implementation_autoset attribute was added in later transformers
+    versions. This patch monkey-patches the class at runtime.
+
+    Also patches FlashAttention2 check to gracefully fall back to eager.
+    """
+    from transformers import PretrainedConfig, modeling_utils
+
+    # Store original to_dict method
+    _original_to_dict = PretrainedConfig.to_dict
+
+    def _patched_to_dict(self):
+        """Patched to_dict that handles missing _attn_implementation_autoset."""
+        result = _original_to_dict(self)
+        # Ensure _attn_implementation_autoset is present
+        if '_attn_implementation_autoset' not in result:
+            result['_attn_implementation_autoset'] = getattr(
+                self, '_attn_implementation_autoset', True
+            )
+        return result
+
+    # Also patch __getattribute__ to handle the attribute access
+    _original_getattribute = PretrainedConfig.__getattribute__
+
+    def _patched_getattribute(self, name):
+        if name == '_attn_implementation_autoset':
+            try:
+                return _original_getattribute(self, name)
+            except AttributeError:
+                return True
+        return _original_getattribute(self, name)
+
+    PretrainedConfig.__getattribute__ = _patched_getattribute
+
+    # Check if flash_attn is available
+    flash_attn_available = False
+    try:
+        import flash_attn  # noqa: F401
+        flash_attn_available = True
+    except ImportError:
+        pass
+
+    # If flash_attn not available, patch to force eager attention
+    if not flash_attn_available and hasattr(modeling_utils, 'PreTrainedModel'):
+
+        def _patched_check(self, *args, **kwargs):
+            """Force eager attention when flash_attn is not available."""
+            # Simply return 'eager' - don't bother with original check
+            # This avoids any flash attention verification
+            if hasattr(self.config, '_attn_implementation'):
+                self.config._attn_implementation = 'eager'
+            if hasattr(self.config, '_attn_implementation_autoset'):
+                self.config._attn_implementation_autoset = False
+            return 'eager'
+
+        modeling_utils.PreTrainedModel._check_and_adjust_attn_implementation = _patched_check
+
+    print("Applied Eagle3 VL compatibility patch")
+
+
+# Apply patch before importing any model code
+_patch_eagle3_vl_config()
+
+from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
 from gr00t.data.dataset.sharded_single_step_dataset import ShardedSingleStepDataset
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.model.gr00t_n1d6.gr00t_n1d6 import Gr00tN1d6
@@ -107,13 +174,16 @@ class FeatureDumper:
 
         # Get embodiment config
         self.embodiment_tag = EmbodimentTag(embodiment_tag)
-        self.modality_config = get_embodiment_config(self.embodiment_tag)
+        self.modality_config = MODALITY_CONFIGS.get(self.embodiment_tag.value)
+        if self.modality_config is None:
+            raise ValueError(f"No modality config found for embodiment tag: {embodiment_tag}")
 
         print(f"Loading model from {model_path}...")
         self.model = Gr00tN1d6.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
+            attn_implementation="eager",  # Use eager attention (no FlashAttention)
         )
         self.model.to(device)
         self.model.eval()
@@ -126,7 +196,11 @@ class FeatureDumper:
             print("WARNING: Backbone has trainable parameters. Features may not be reusable!")
 
         # Create processor for data loading
-        self.processor = Gr00tN1d6Processor.from_pretrained(model_path)
+        # Pass modality_config so the processor knows about our custom embodiment
+        self.processor = Gr00tN1d6Processor.from_pretrained(
+            model_path,
+            modality_configs={embodiment_tag: self.modality_config}
+        )
         self.processor.eval()  # Disable training augmentations
 
         # Create dataset
@@ -268,7 +342,11 @@ class FeatureDumper:
 
         # Save embodiment_id as JSON
         if sample["embodiment_id"] is not None:
-            emb_data = json.dumps({"embodiment_id": int(sample["embodiment_id"])}).encode()
+            emb_id = sample["embodiment_id"]
+            # Handle tensor conversion
+            if hasattr(emb_id, 'item'):
+                emb_id = emb_id.item()
+            emb_data = json.dumps({"embodiment_id": int(emb_id)}).encode()
             emb_buf = BytesIO(emb_data)
             emb_info = tarfile.TarInfo(name=f"{key}.json")
             emb_info.size = len(emb_data)
@@ -329,7 +407,7 @@ class FeatureDumper:
                         "state": extracted["state"][i] if extracted["state"] is not None else None,
                         "action": extracted["action"][i] if extracted["action"] is not None else None,
                         "action_mask": extracted["action_mask"][i] if extracted["action_mask"] is not None else None,
-                        "embodiment_id": extracted["embodiment_id"] if extracted["embodiment_id"] is not None else None,
+                        "embodiment_id": extracted["embodiment_id"][i] if extracted["embodiment_id"] is not None else None,
                     }
 
                     self._write_webdataset_sample(current_tar, global_idx, sample)

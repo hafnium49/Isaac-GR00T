@@ -41,7 +41,13 @@ import numpy as np
 
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import select_best_resolution
-from transformers.image_utils import ImageInput, VideoInput, get_image_size, to_numpy_array
+from transformers.image_utils import ImageInput, get_image_size, to_numpy_array
+# VideoInput may not exist in older transformers versions - provide fallback
+try:
+    from transformers.image_utils import VideoInput
+except ImportError:
+    from typing import List, Union
+    VideoInput = Union[List["ImageInput"], "np.ndarray", "torch.Tensor"]
 from transformers.processing_utils import ProcessingKwargs, ProcessorMixin, Unpack
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.utils import logging

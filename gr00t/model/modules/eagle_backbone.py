@@ -38,13 +38,35 @@ class EagleBackbone(torch.nn.Module):
             extra_kwargs["torch_dtype"] = torch.bfloat16
 
         if model_name == "nvidia/Eagle-Block2A-2B-v2":
-            assert use_flash_attention, (
-                "nvidia/Eagle-Block2A-2B-v2 requires flash attention by default"
-            )
+            # FlashAttention not available on all platforms (e.g., GX10/Jetson Thor)
+            # Fall back to eager attention if flash_attn is not installed
+            if use_flash_attention:
+                try:
+                    import flash_attn  # noqa: F401
+                except ImportError:
+                    print("WARNING: flash_attn not installed, falling back to eager attention")
+                    use_flash_attention = False
+                    extra_kwargs.pop("attn_implementation", None)
+
             assert load_bf16, "nvidia/Eagle-Block2A-2B-v2 requires bfloat16 by default"
             eagle_path = os.path.join(os.path.dirname(__file__), "nvidia", "Eagle-Block2A-2B-v2")
             config = AutoConfig.from_pretrained(eagle_path, trust_remote_code=True)
-            self.model = AutoModel.from_config(config, trust_remote_code=True)
+            # Force eager attention if flash_attn is not available
+            attn_impl = "flash_attention_2" if use_flash_attention else "eager"
+            # Set attn_implementation on all nested configs
+            config._attn_implementation = attn_impl
+            config._attn_implementation_autoset = False
+            if hasattr(config, 'vision_config'):
+                config.vision_config._attn_implementation = attn_impl
+                config.vision_config._attn_implementation_autoset = False
+            if hasattr(config, 'text_config'):
+                config.text_config._attn_implementation = attn_impl
+                config.text_config._attn_implementation_autoset = False
+            self.model = AutoModel.from_config(
+                config,
+                trust_remote_code=True,
+                attn_implementation=attn_impl,
+            )
         else:
             raise ValueError(f"Model {model_name} not supported")
 
