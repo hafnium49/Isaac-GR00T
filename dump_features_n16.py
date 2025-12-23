@@ -24,6 +24,8 @@ import gc
 import hashlib
 import json
 import os
+import shutil
+import signal
 import sys
 import tarfile
 import time
@@ -136,6 +138,136 @@ def compute_config_hash(config: dict) -> str:
     return hashlib.md5(config_str.encode()).hexdigest()[:8]
 
 
+class GracefulShutdown:
+    """Handles graceful shutdown on SIGINT/SIGTERM."""
+
+    def __init__(self):
+        self._shutdown_requested = False
+        self._original_sigint = None
+        self._original_sigterm = None
+
+    def register(self):
+        """Register signal handlers."""
+        self._original_sigint = signal.signal(signal.SIGINT, self._handler)
+        self._original_sigterm = signal.signal(signal.SIGTERM, self._handler)
+
+    def _handler(self, signum, frame):
+        """Signal handler that sets shutdown flag."""
+        sig_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
+        print(f"\n[{sig_name}] Graceful shutdown requested. Finishing current shard...")
+        self._shutdown_requested = True
+
+    @property
+    def shutdown_requested(self) -> bool:
+        return self._shutdown_requested
+
+    def restore(self):
+        """Restore original signal handlers."""
+        if self._original_sigint:
+            signal.signal(signal.SIGINT, self._original_sigint)
+        if self._original_sigterm:
+            signal.signal(signal.SIGTERM, self._original_sigterm)
+
+
+class CheckpointManager:
+    """Manages checkpoint save/load for resumable feature extraction."""
+
+    CHECKPOINT_FILE = ".dumper_checkpoint.json"
+    VERSION = 1
+
+    def __init__(self, output_dir: Path, config_hash: str):
+        self.output_dir = output_dir
+        self.checkpoint_path = output_dir / self.CHECKPOINT_FILE
+        self.config_hash = config_hash
+        self._created_at = None
+
+    def checkpoint_exists(self) -> bool:
+        """Check if a valid checkpoint file exists."""
+        return self.checkpoint_path.exists()
+
+    def load(self) -> dict | None:
+        """Load and validate checkpoint. Returns None if invalid."""
+        if not self.checkpoint_exists():
+            return None
+
+        with open(self.checkpoint_path, "r") as f:
+            ckpt = json.load(f)
+
+        # Validate version
+        if ckpt.get("version") != self.VERSION:
+            print(f"WARNING: Checkpoint version mismatch (got {ckpt.get('version')}, expected {self.VERSION})")
+            return None
+
+        # Validate config hash
+        if ckpt.get("config_hash") != self.config_hash:
+            print(f"WARNING: Config hash mismatch. Cannot resume.")
+            print(f"  Checkpoint: {ckpt.get('config_hash')}")
+            print(f"  Current:    {self.config_hash}")
+            return None
+
+        return ckpt
+
+    def save(self, state: dict):
+        """Save checkpoint state atomically."""
+        if self._created_at is None:
+            self._created_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+        state["version"] = self.VERSION
+        state["config_hash"] = self.config_hash
+        state["created_at"] = self._created_at
+        state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+        # Convert numpy types to native Python types for JSON serialization
+        def convert_numpy(obj):
+            if isinstance(obj, dict):
+                return {k: convert_numpy(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_numpy(v) for v in obj]
+            elif hasattr(obj, "item"):  # numpy scalar types
+                return obj.item()
+            return obj
+
+        state = convert_numpy(state)
+
+        # Write atomically using temp file
+        tmp_path = self.checkpoint_path.with_suffix(".tmp")
+        with open(tmp_path, "w") as f:
+            json.dump(state, f, indent=2)
+        tmp_path.rename(self.checkpoint_path)
+
+    def delete(self):
+        """Remove checkpoint file on successful completion."""
+        if self.checkpoint_path.exists():
+            self.checkpoint_path.unlink()
+
+    def validate_existing_shards(self, expected_count: int) -> bool:
+        """Verify that expected shard files exist and are valid."""
+        for i in range(expected_count):
+            shard_path = self.output_dir / f"shard-{i:06d}.tar"
+            if not shard_path.exists():
+                print(f"ERROR: Missing shard file: {shard_path}")
+                return False
+            # Verify TAR is readable
+            try:
+                with tarfile.open(shard_path, "r") as tar:
+                    _ = tar.getnames()
+            except Exception as e:
+                print(f"ERROR: Corrupt shard file {shard_path}: {e}")
+                return False
+        return True
+
+    def cleanup_incomplete_shards(self, last_complete: int):
+        """Remove any shard files beyond the last complete one."""
+        for shard_path in self.output_dir.glob("shard-*.tar"):
+            try:
+                idx = int(shard_path.stem.split("-")[1])
+                if idx >= last_complete:
+                    print(f"Removing incomplete shard: {shard_path}")
+                    shard_path.unlink()
+            except (ValueError, IndexError):
+                pass
+
+
 class FeatureDumper:
     """
     Extracts and caches Eagle backbone features from a LeRobot dataset.
@@ -160,6 +292,7 @@ class FeatureDumper:
         video_backend: str = "preextracted",
         num_workers: int = 4,
         device: str = "cuda",
+        checkpoint_interval: int = 5,
     ):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
@@ -167,6 +300,8 @@ class FeatureDumper:
         self.shard_size = shard_size
         self.batch_size = batch_size
         self.device = device
+        self.checkpoint_interval = checkpoint_interval
+        self.shutdown_handler = GracefulShutdown()
 
         # Load modality config if provided
         if modality_config_path:
@@ -239,6 +374,12 @@ class FeatureDumper:
         }
         self.metadata["config_hash"] = compute_config_hash(self.metadata)
 
+        # Initialize checkpoint manager
+        self.checkpoint_manager = CheckpointManager(
+            output_dir=self.output_dir,
+            config_hash=self.metadata["config_hash"],
+        )
+
     def _load_modality_config(self, path: str):
         """Load custom modality config from a Python file."""
         import importlib.util
@@ -284,6 +425,62 @@ class FeatureDumper:
             "action_mask": inputs["action_mask"].cpu() if "action_mask" in inputs else None,
             "embodiment_id": inputs["embodiment_id"] if "embodiment_id" in inputs else None,
         }
+
+    def _compute_resume_state(self, checkpoint: dict) -> tuple[int, int, int, int]:
+        """
+        Compute where to resume processing from checkpoint.
+
+        Returns:
+            (dataset_shard_idx, batch_start, output_shard_idx, global_idx)
+        """
+        last_global_idx = checkpoint["last_complete_global_idx"]
+        output_shard_idx = checkpoint["output_state"]["current_shard_idx"]
+
+        # Calculate which input dataset shard contains this sample
+        cumulative = 0
+        dataset_shard_idx = 0
+        batch_start = 0
+
+        for shard_idx, length in enumerate(self.dataset.shard_lengths):
+            if cumulative + length > last_global_idx:
+                dataset_shard_idx = shard_idx
+                # Offset within this shard
+                offset_in_shard = last_global_idx - cumulative
+                # Round down to batch boundary
+                batch_start = (offset_in_shard // self.batch_size) * self.batch_size
+                break
+            cumulative += length
+        else:
+            # All samples processed
+            dataset_shard_idx = len(self.dataset)
+            batch_start = 0
+
+        return (dataset_shard_idx, batch_start, output_shard_idx, last_global_idx)
+
+    def _save_checkpoint(
+        self,
+        global_idx: int,
+        current_shard_idx: int,
+        dataset_shard_idx: int,
+        batch_start: int,
+        total_samples: int,
+    ):
+        """Save checkpoint state."""
+        state = {
+            "total_samples": total_samples,
+            "completed_shards": current_shard_idx,
+            "last_complete_global_idx": global_idx,
+            "input_dataset_state": {
+                "dataset_shard_idx": dataset_shard_idx,
+                "batch_start_within_shard": batch_start,
+            },
+            "output_state": {
+                "current_shard_idx": current_shard_idx,
+                "samples_in_shard": 0,
+            },
+        }
+        self.checkpoint_manager.save(state)
+        print(f"Checkpoint saved: {global_idx}/{total_samples} samples, {current_shard_idx} shards")
 
     def _write_webdataset_sample(self, tar: tarfile.TarFile, idx: int, sample: dict):
         """Write a single sample to a WebDataset tar file."""
@@ -352,77 +549,138 @@ class FeatureDumper:
             emb_info.size = len(emb_data)
             tar.addfile(emb_info, emb_buf)
 
-    def dump_webdataset(self):
-        """Dump features to WebDataset format (tar shards)."""
-        print(f"Dumping features to WebDataset format at {self.output_dir}")
+    def dump_webdataset(self, resume_checkpoint: dict | None = None):
+        """Dump features to WebDataset format (tar shards) with resumption support."""
+        # Register signal handlers for graceful shutdown
+        self.shutdown_handler.register()
 
         total_samples = sum(self.dataset.shard_lengths)
+        print(f"Dumping features to WebDataset format at {self.output_dir}")
         print(f"Total samples: {total_samples}")
         print(f"Shard size: {self.shard_size}")
 
-        # Save metadata
-        meta_path = self.output_dir / "metadata.json"
-        with open(meta_path, "w") as f:
-            json.dump(self.metadata, f, indent=2)
-        print(f"Saved metadata to {meta_path}")
+        # Initialize state (fresh start or resume)
+        if resume_checkpoint is not None:
+            start_dataset_shard, start_batch, current_shard_idx, global_idx = \
+                self._compute_resume_state(resume_checkpoint)
+            print(f"Resuming from: global_idx={global_idx}, output_shard={current_shard_idx}")
+        else:
+            start_dataset_shard = 0
+            start_batch = 0
+            current_shard_idx = 0
+            global_idx = 0
+
+            # Save metadata for fresh run
+            meta_path = self.output_dir / "metadata.json"
+            with open(meta_path, "w") as f:
+                json.dump(self.metadata, f, indent=2)
+            print(f"Saved metadata to {meta_path}")
 
         current_tar = None
-        current_shard_idx = 0
         samples_in_shard = 0
-        global_idx = 0
+        shards_since_checkpoint = 0
+        last_completed_shard_global_idx = global_idx
 
         # Process all dataset shards
-        pbar = tqdm(total=total_samples, desc="Extracting features")
+        pbar = tqdm(total=total_samples, initial=global_idx, desc="Extracting features")
 
-        for shard_idx in range(len(self.dataset)):
-            # Load shard data
-            shard_data = self.dataset.get_shard(shard_idx)
+        try:
+            for shard_idx in range(start_dataset_shard, len(self.dataset)):
+                # Load shard data
+                shard_data = self.dataset.get_shard(shard_idx)
 
-            # Create batches
-            for batch_start in range(0, len(shard_data), self.batch_size):
-                batch_end = min(batch_start + self.batch_size, len(shard_data))
-                batch = shard_data[batch_start:batch_end]
+                # Determine batch start (for resume)
+                batch_start_offset = start_batch if shard_idx == start_dataset_shard else 0
 
-                # Collate and extract
-                collated = self.collate_fn(batch)
-                extracted = self.extract_features(collated)
+                # Create batches
+                for batch_start in range(batch_start_offset, len(shard_data), self.batch_size):
+                    # Check for shutdown request
+                    if self.shutdown_handler.shutdown_requested:
+                        raise KeyboardInterrupt("Graceful shutdown requested")
 
-                # Write samples
-                batch_size = extracted["features"].shape[0]
-                for i in range(batch_size):
-                    # Create new shard if needed
-                    if current_tar is None or samples_in_shard >= self.shard_size:
-                        if current_tar is not None:
-                            current_tar.close()
-                        tar_path = self.output_dir / f"shard-{current_shard_idx:06d}.tar"
-                        current_tar = tarfile.open(tar_path, "w")
-                        current_shard_idx += 1
-                        samples_in_shard = 0
+                    batch_end = min(batch_start + self.batch_size, len(shard_data))
+                    batch = shard_data[batch_start:batch_end]
 
-                    # Extract single sample
-                    sample = {
-                        "features": extracted["features"][i],
-                        "attention_mask": extracted["attention_mask"][i],
-                        "image_mask": extracted["image_mask"][i],
-                        "state": extracted["state"][i] if extracted["state"] is not None else None,
-                        "action": extracted["action"][i] if extracted["action"] is not None else None,
-                        "action_mask": extracted["action_mask"][i] if extracted["action_mask"] is not None else None,
-                        "embodiment_id": extracted["embodiment_id"][i] if extracted["embodiment_id"] is not None else None,
-                    }
+                    # Collate and extract
+                    collated = self.collate_fn(batch)
+                    extracted = self.extract_features(collated)
 
-                    self._write_webdataset_sample(current_tar, global_idx, sample)
-                    global_idx += 1
-                    samples_in_shard += 1
-                    pbar.update(1)
+                    # Write samples
+                    batch_size_actual = extracted["features"].shape[0]
+                    for i in range(batch_size_actual):
+                        # Create new shard if needed
+                        if current_tar is None or samples_in_shard >= self.shard_size:
+                            if current_tar is not None:
+                                current_tar.close()
+                                shards_since_checkpoint += 1
 
-                # Free memory
-                del extracted
-                torch.cuda.empty_cache()
+                                # Update tracking for checkpoint
+                                last_completed_shard_global_idx = global_idx
 
-            # Free shard memory
-            del shard_data
-            gc.collect()
+                                # Save checkpoint periodically
+                                if shards_since_checkpoint >= self.checkpoint_interval:
+                                    self._save_checkpoint(
+                                        global_idx=global_idx,
+                                        current_shard_idx=current_shard_idx,
+                                        dataset_shard_idx=shard_idx,
+                                        batch_start=batch_start,
+                                        total_samples=total_samples,
+                                    )
+                                    shards_since_checkpoint = 0
 
+                            tar_path = self.output_dir / f"shard-{current_shard_idx:06d}.tar"
+                            current_tar = tarfile.open(tar_path, "w")
+                            current_shard_idx += 1
+                            samples_in_shard = 0
+
+                        # Extract single sample
+                        sample = {
+                            "features": extracted["features"][i],
+                            "attention_mask": extracted["attention_mask"][i],
+                            "image_mask": extracted["image_mask"][i],
+                            "state": extracted["state"][i] if extracted["state"] is not None else None,
+                            "action": extracted["action"][i] if extracted["action"] is not None else None,
+                            "action_mask": extracted["action_mask"][i] if extracted["action_mask"] is not None else None,
+                            "embodiment_id": extracted["embodiment_id"][i] if extracted["embodiment_id"] is not None else None,
+                        }
+
+                        self._write_webdataset_sample(current_tar, global_idx, sample)
+                        global_idx += 1
+                        samples_in_shard += 1
+                        pbar.update(1)
+
+                    # Free memory
+                    del extracted
+                    torch.cuda.empty_cache()
+
+                # Free shard memory
+                del shard_data
+                gc.collect()
+
+        except KeyboardInterrupt:
+            # Graceful shutdown: close current tar and save checkpoint
+            print("\nShutdown: saving checkpoint...")
+            if current_tar is not None:
+                current_tar.close()
+                # The current shard is incomplete, so checkpoint points to start of it
+                current_shard_idx -= 1
+
+            self._save_checkpoint(
+                global_idx=last_completed_shard_global_idx,
+                current_shard_idx=current_shard_idx,
+                dataset_shard_idx=shard_idx,
+                batch_start=batch_start,
+                total_samples=total_samples,
+            )
+            pbar.close()
+            self.shutdown_handler.restore()
+            print("Checkpoint saved. Run with --resume to continue.")
+            sys.exit(130)  # Standard exit code for SIGINT
+
+        finally:
+            self.shutdown_handler.restore()
+
+        # Normal completion
         if current_tar is not None:
             current_tar.close()
 
@@ -433,11 +691,15 @@ class FeatureDumper:
             "num_samples": global_idx,
             "num_shards": current_shard_idx,
             "shard_size": self.shard_size,
+            "format": "webdataset",
             "metadata": self.metadata,
         }
         index_path = self.output_dir / "index.json"
         with open(index_path, "w") as f:
             json.dump(index, f, indent=2)
+
+        # Remove checkpoint on success
+        self.checkpoint_manager.delete()
 
         print(f"\nDone! Wrote {global_idx} samples to {current_shard_idx} shards")
         print(f"Index: {index_path}")
@@ -523,11 +785,13 @@ class FeatureDumper:
 
         print(f"\nDone! Wrote {global_idx} samples to LMDB")
 
-    def run(self):
+    def run(self, resume_checkpoint: dict | None = None):
         """Run the feature dumping process."""
         if self.output_format == "webdataset":
-            self.dump_webdataset()
+            self.dump_webdataset(resume_checkpoint=resume_checkpoint)
         elif self.output_format == "lmdb":
+            if resume_checkpoint is not None:
+                print("WARNING: LMDB format does not support resumption. Starting fresh.")
             self.dump_lmdb()
         else:
             raise ValueError(f"Unknown format: {self.output_format}")
@@ -604,8 +868,40 @@ def main():
         default="cuda",
         help="Device to run on",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from previous checkpoint if available",
+    )
+    parser.add_argument(
+        "--force-restart",
+        action="store_true",
+        help="Ignore existing checkpoint and start fresh (deletes previous output)",
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=5,
+        help="Save checkpoint every N completed shards (default: 5)",
+    )
 
     args = parser.parse_args()
+
+    output_dir = Path(args.output_dir)
+    checkpoint_path = output_dir / CheckpointManager.CHECKPOINT_FILE
+
+    # Handle existing output directory
+    if output_dir.exists():
+        if args.force_restart:
+            print(f"Force restart: removing existing output at {output_dir}")
+            shutil.rmtree(output_dir)
+        elif checkpoint_path.exists() and not args.resume:
+            print(f"ERROR: Output directory exists with checkpoint at {output_dir}")
+            print(f"  Use --resume to continue, or --force-restart to start fresh.")
+            sys.exit(1)
+        elif not checkpoint_path.exists() and args.resume:
+            print(f"WARNING: --resume specified but no checkpoint found. Starting fresh.")
+            args.resume = False
 
     print("=" * 60)
     print("GR00T N1.6 Feature Dumper")
@@ -614,6 +910,8 @@ def main():
     print(f"Output: {args.output_dir}")
     print(f"Format: {args.format}")
     print(f"Batch:  {args.batch_size}")
+    if args.resume:
+        print(f"Mode:   RESUME from checkpoint")
     print("=" * 60)
 
     dumper = FeatureDumper(
@@ -628,10 +926,31 @@ def main():
         video_backend=args.video_backend,
         num_workers=args.num_workers,
         device=args.device,
+        checkpoint_interval=args.checkpoint_interval,
     )
 
+    # Load and validate checkpoint if resuming
+    resume_checkpoint = None
+    if args.resume and checkpoint_path.exists():
+        print("Loading checkpoint...")
+        resume_checkpoint = dumper.checkpoint_manager.load()
+        if resume_checkpoint is None:
+            print("ERROR: Checkpoint validation failed. Use --force-restart to start fresh.")
+            sys.exit(1)
+
+        # Validate existing shards
+        expected_shards = resume_checkpoint["completed_shards"]
+        print(f"Validating {expected_shards} existing shards...")
+        if not dumper.checkpoint_manager.validate_existing_shards(expected_shards):
+            print("ERROR: Some shard files are missing or corrupted.")
+            sys.exit(1)
+
+        # Clean up any incomplete shards
+        dumper.checkpoint_manager.cleanup_incomplete_shards(expected_shards)
+        print(f"Resuming from {resume_checkpoint['last_complete_global_idx']} samples, {expected_shards} shards")
+
     start_time = time.time()
-    dumper.run()
+    dumper.run(resume_checkpoint=resume_checkpoint)
     elapsed = time.time() - start_time
 
     print(f"\nTotal time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
