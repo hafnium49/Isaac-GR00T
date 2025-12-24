@@ -3,15 +3,67 @@
   <img src="media/header_compress.png" width="800" alt="NVIDIA Isaac GR00T N1.6 Header">
 
   <!-- --- -->
-  
+
   <p style="font-size: 1.2em;">
-    <a href="https://developer.nvidia.com/isaac/gr00t"><strong>Website</strong></a> | 
+    <a href="https://developer.nvidia.com/isaac/gr00t"><strong>Website</strong></a> |
     <a href="https://huggingface.co/nvidia/GR00T-N1.6-3B"><strong>Model</strong></a> |
     <a href="https://huggingface.co/datasets/nvidia/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim"><strong>Dataset</strong></a> |
     <a href="https://arxiv.org/abs/2503.14734"><strong>Paper</strong></a> |
     <a href="https://research.nvidia.com/labs/gear/gr00t-n1_6/"><strong>Research Blog</strong></a>
   </p>
 </div>
+
+---
+
+## Fork Additions: GX10 Optimizations & Feature Dumper
+
+This fork (`feature/cached-training` branch) includes optimizations for training on **ASUS Ascent GX10 (Grace Blackwell)** and other memory-constrained systems. Key additions:
+
+### Feature Dumper (Offline Backbone Caching)
+
+Pre-compute Eagle backbone features to bypass the 2B-parameter forward pass during training:
+
+```bash
+python dump_features_n16.py \
+  --input-dir /path/to/lerobot_dataset \
+  --output-dir /path/to/cached_features \
+  --model-path nvidia/GR00T-N1.6-3B \
+  --modality-config examples/SO100/so100_config.py \
+  --embodiment-tag new_embodiment \
+  --batch-size 2 \
+  --shard-size 100 \
+  --format webdataset
+```
+
+**Performance Gains:**
+| Scenario | Time/Step | 50k Steps |
+|----------|-----------|-----------|
+| Live Backbone | ~5s | ~70 hours |
+| **Feature Dumper** | **<0.05s** | **~40 min** |
+
+**Features:**
+- Resumption support (`--resume`, `--force-restart`)
+- Graceful shutdown (Ctrl+C saves checkpoint)
+- Timestamped logging (`--log-level`, `--log-file`)
+- WebDataset and LMDB output formats
+
+### GX10 Compatibility Patches (11 total)
+
+Automatically applied for eager attention fallback when FlashAttention is unavailable:
+- Eagle3 VL backbone patches for Qwen/SigLIP models
+- Config `to_dict()` compatibility fixes
+- `VideoInput` import fallbacks
+
+### Tested Results (Dec 2025)
+
+| Metric | Result |
+|--------|--------|
+| Dataset | SO-101 Phase 1 (128,935 samples) |
+| Feature extraction | ~9.6 samples/sec |
+| Cached training | ~16-17 steps/sec |
+| Total cached size | 214 GB (1,290 shards) |
+
+---
 
 ## NVIDIA Isaac GR00T
 
