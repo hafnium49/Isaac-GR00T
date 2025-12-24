@@ -141,7 +141,8 @@ class Gr00tN1d6ActionHead(nn.Module):
         alpha = torch.tensor(self.noise_alpha, device=device, dtype=dtype)
         beta_val = torch.tensor(self.noise_beta, device=device, dtype=dtype)
         beta_dist = Beta(alpha, beta_val)
-        sample = beta_dist.sample([batch_size])
+        # Explicitly move sample to device (Beta.sample may return CPU tensor)
+        sample = beta_dist.sample([batch_size]).to(device=device, dtype=dtype)
         sample = (1 - sample) * self.config.noise_s
         return sample
 

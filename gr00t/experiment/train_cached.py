@@ -23,10 +23,11 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoModel, get_linear_schedule_with_warmup, set_seed
+from transformers import get_linear_schedule_with_warmup, set_seed
 import wandb
 
 from gr00t.configs.base_config import Config
+from gr00t.model.gr00t_n1d6.gr00t_n1d6 import Gr00tN1d6
 from gr00t.data.dataset.cached_dataset import (
     CachedFeatureCollator,
     CachedFeatureDataset,
@@ -96,7 +97,7 @@ def run_cached_training(
 
     # Load model
     logging.info(f"Loading model from {config.training.start_from_checkpoint}...")
-    model = AutoModel.from_pretrained(
+    model = Gr00tN1d6.from_pretrained(
         config.training.start_from_checkpoint,
         tune_llm=False,  # Force frozen backbone
         tune_visual=False,  # Force frozen backbone
@@ -106,6 +107,14 @@ def run_cached_training(
         tune_vlln=config.model.tune_vlln,
         state_dropout_prob=config.model.state_dropout_prob,
         trust_remote_code=True,
+    )
+
+    # Force freeze backbone - from_pretrained kwargs don't reliably update config
+    # This explicitly calls eagle_backbone.py:set_trainable_parameters() to freeze all backbone params
+    model.backbone.set_trainable_parameters(
+        tune_llm=False,
+        tune_visual=False,
+        tune_top_llm_layers=0,
     )
 
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
