@@ -100,6 +100,7 @@ def run_cached_training(
         config.training.start_from_checkpoint,
         tune_llm=False,  # Force frozen backbone
         tune_visual=False,  # Force frozen backbone
+        tune_top_llm_layers=0,  # Force all LLM layers frozen (override config default of 4)
         tune_projector=config.model.tune_projector,
         tune_diffusion_model=config.model.tune_diffusion_model,
         tune_vlln=config.model.tune_vlln,
