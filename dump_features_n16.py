@@ -23,6 +23,7 @@ import argparse
 import gc
 import hashlib
 import json
+import logging
 import os
 import shutil
 import signal
@@ -138,6 +139,173 @@ def compute_config_hash(config: dict) -> str:
     return hashlib.md5(config_str.encode()).hexdigest()[:8]
 
 
+class LoggingManager:
+    """Manages file and console logging with performance metrics."""
+
+    def __init__(self, output_dir: Path, log_level: str = "INFO", log_file: str | None = None):
+        self.output_dir = output_dir
+        self.log_level = getattr(logging, log_level.upper(), logging.INFO)
+
+        # Create logger
+        self.logger = logging.getLogger("FeatureDumper")
+        self.logger.setLevel(logging.DEBUG)  # Capture all levels
+        self.logger.handlers.clear()  # Remove any existing handlers
+
+        # Log file path
+        if log_file:
+            self.log_path = Path(log_file)
+        else:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            self.log_path = output_dir / f"dumper_{timestamp}.log"
+
+        # Ensure output directory exists
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # File handler (DEBUG level - captures everything)
+        file_handler = logging.FileHandler(self.log_path)
+        file_handler.setLevel(logging.DEBUG)
+        file_format = logging.Formatter("%(asctime)s %(levelname)-5s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        file_handler.setFormatter(file_format)
+        self.logger.addHandler(file_handler)
+
+        # Console handler (user-specified level)
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(self.log_level)
+        console_format = logging.Formatter("%(levelname)-5s | %(message)s")
+        console_handler.setFormatter(console_format)
+        self.logger.addHandler(console_handler)
+
+    def info(self, msg: str):
+        self.logger.info(msg)
+
+    def warning(self, msg: str):
+        self.logger.warning(msg)
+
+    def error(self, msg: str):
+        self.logger.error(msg)
+
+    def debug(self, msg: str):
+        self.logger.debug(msg)
+
+    def log_config(self, config: dict):
+        """Log configuration settings."""
+        self.info("Configuration:")
+        for key, value in config.items():
+            self.info(f"  {key}: {value}")
+
+    def log_metrics(self, samples_processed: int, total_samples: int, elapsed: float, shards: int):
+        """Log periodic performance metrics."""
+        pct = (samples_processed / total_samples) * 100 if total_samples > 0 else 0
+        throughput = samples_processed / elapsed if elapsed > 0 else 0
+        self.info(f"Progress: {samples_processed:,}/{total_samples:,} ({pct:.1f}%) | {shards} shards | {throughput:.1f} samples/sec")
+
+    def log_final_summary(self, total_samples: int, total_shards: int, total_time: float, peak_throughput: float):
+        """Log completion summary."""
+        avg_throughput = total_samples / total_time if total_time > 0 else 0
+        hours = int(total_time // 3600)
+        minutes = int((total_time % 3600) // 60)
+        seconds = int(total_time % 60)
+
+        self.info("=" * 60)
+        self.info("FEATURE DUMPER COMPLETE")
+        self.info("=" * 60)
+        self.info(f"Total samples:    {total_samples:,}")
+        self.info(f"Total shards:     {total_shards:,}")
+        self.info(f"Total time:       {hours}h {minutes}m {seconds}s")
+        self.info(f"Avg throughput:   {avg_throughput:.2f} samples/sec")
+        self.info(f"Peak throughput:  {peak_throughput:.2f} samples/sec")
+        self.info(f"Log file:         {self.log_path}")
+        self.info("=" * 60)
+
+
+class PerformanceTracker:
+    """Tracks timing and throughput metrics."""
+
+    def __init__(self):
+        self.start_time: float | None = None
+        self.batch_times: list[float] = []
+        self.shard_times: list[float] = []
+        self.samples_processed: int = 0
+        self._batch_start: float | None = None
+        self._shard_start: float | None = None
+        self._window_samples: list[tuple[float, int]] = []  # (timestamp, cumulative_samples)
+
+    def start(self):
+        """Start overall timing."""
+        self.start_time = time.time()
+        self._shard_start = self.start_time
+
+    def start_batch(self):
+        """Start timing a batch."""
+        self._batch_start = time.time()
+
+    def end_batch(self, batch_size: int):
+        """End batch timing and record metrics."""
+        if self._batch_start is not None:
+            elapsed = time.time() - self._batch_start
+            self.batch_times.append(elapsed)
+            self.samples_processed += batch_size
+            self._window_samples.append((time.time(), self.samples_processed))
+            # Keep only last 100 samples for windowed throughput
+            if len(self._window_samples) > 100:
+                self._window_samples.pop(0)
+
+    def end_shard(self):
+        """End shard timing and record metrics."""
+        if self._shard_start is not None:
+            elapsed = time.time() - self._shard_start
+            self.shard_times.append(elapsed)
+            self._shard_start = time.time()
+
+    def get_elapsed(self) -> float:
+        """Get total elapsed time."""
+        if self.start_time is None:
+            return 0.0
+        return time.time() - self.start_time
+
+    def get_throughput(self) -> float:
+        """Get overall average throughput (samples/sec)."""
+        elapsed = self.get_elapsed()
+        if elapsed <= 0:
+            return 0.0
+        return self.samples_processed / elapsed
+
+    def get_recent_throughput(self) -> float:
+        """Get recent throughput from sliding window."""
+        if len(self._window_samples) < 2:
+            return self.get_throughput()
+        oldest = self._window_samples[0]
+        newest = self._window_samples[-1]
+        time_diff = newest[0] - oldest[0]
+        sample_diff = newest[1] - oldest[1]
+        if time_diff <= 0:
+            return 0.0
+        return sample_diff / time_diff
+
+    def get_peak_throughput(self) -> float:
+        """Get peak throughput from batch times."""
+        if not self.batch_times:
+            return 0.0
+        # Estimate samples per batch from total
+        if len(self.batch_times) > 0:
+            avg_batch_time = sum(self.batch_times) / len(self.batch_times)
+            if avg_batch_time > 0:
+                # Use recent throughput as approximation
+                return max(self.get_recent_throughput(), self.get_throughput())
+        return self.get_throughput()
+
+    def get_summary(self) -> dict:
+        """Get performance summary."""
+        return {
+            "total_time": self.get_elapsed(),
+            "samples_processed": self.samples_processed,
+            "avg_throughput": self.get_throughput(),
+            "peak_throughput": self.get_peak_throughput(),
+            "num_batches": len(self.batch_times),
+            "num_shards": len(self.shard_times),
+        }
+
+
 class GracefulShutdown:
     """Handles graceful shutdown on SIGINT/SIGTERM."""
 
@@ -175,11 +343,19 @@ class CheckpointManager:
     CHECKPOINT_FILE = ".dumper_checkpoint.json"
     VERSION = 1
 
-    def __init__(self, output_dir: Path, config_hash: str):
+    def __init__(self, output_dir: Path, config_hash: str, logger: LoggingManager | None = None):
         self.output_dir = output_dir
         self.checkpoint_path = output_dir / self.CHECKPOINT_FILE
         self.config_hash = config_hash
         self._created_at = None
+        self._logger = logger
+
+    def _log(self, level: str, msg: str):
+        """Log message using logger if available, else print."""
+        if self._logger:
+            getattr(self._logger, level)(msg)
+        else:
+            print(f"{level.upper()}: {msg}" if level != "info" else msg)
 
     def checkpoint_exists(self) -> bool:
         """Check if a valid checkpoint file exists."""
@@ -195,14 +371,14 @@ class CheckpointManager:
 
         # Validate version
         if ckpt.get("version") != self.VERSION:
-            print(f"WARNING: Checkpoint version mismatch (got {ckpt.get('version')}, expected {self.VERSION})")
+            self._log("warning", f"Checkpoint version mismatch (got {ckpt.get('version')}, expected {self.VERSION})")
             return None
 
         # Validate config hash
         if ckpt.get("config_hash") != self.config_hash:
-            print(f"WARNING: Config hash mismatch. Cannot resume.")
-            print(f"  Checkpoint: {ckpt.get('config_hash')}")
-            print(f"  Current:    {self.config_hash}")
+            self._log("warning", "Config hash mismatch. Cannot resume.")
+            self._log("warning", f"  Checkpoint: {ckpt.get('config_hash')}")
+            self._log("warning", f"  Current:    {self.config_hash}")
             return None
 
         return ckpt
@@ -245,14 +421,14 @@ class CheckpointManager:
         for i in range(expected_count):
             shard_path = self.output_dir / f"shard-{i:06d}.tar"
             if not shard_path.exists():
-                print(f"ERROR: Missing shard file: {shard_path}")
+                self._log("error", f"Missing shard file: {shard_path}")
                 return False
             # Verify TAR is readable
             try:
                 with tarfile.open(shard_path, "r") as tar:
                     _ = tar.getnames()
             except Exception as e:
-                print(f"ERROR: Corrupt shard file {shard_path}: {e}")
+                self._log("error", f"Corrupt shard file {shard_path}: {e}")
                 return False
         return True
 
@@ -262,7 +438,7 @@ class CheckpointManager:
             try:
                 idx = int(shard_path.stem.split("-")[1])
                 if idx >= last_complete:
-                    print(f"Removing incomplete shard: {shard_path}")
+                    self._log("info", f"Removing incomplete shard: {shard_path}")
                     shard_path.unlink()
             except (ValueError, IndexError):
                 pass
@@ -293,6 +469,8 @@ class FeatureDumper:
         num_workers: int = 4,
         device: str = "cuda",
         checkpoint_interval: int = 5,
+        log_level: str = "INFO",
+        log_file: str | None = None,
     ):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
@@ -302,6 +480,11 @@ class FeatureDumper:
         self.device = device
         self.checkpoint_interval = checkpoint_interval
         self.shutdown_handler = GracefulShutdown()
+
+        # Initialize logging and performance tracking
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.log = LoggingManager(self.output_dir, log_level, log_file)
+        self.perf = PerformanceTracker()
 
         # Load modality config if provided
         if modality_config_path:
@@ -313,7 +496,7 @@ class FeatureDumper:
         if self.modality_config is None:
             raise ValueError(f"No modality config found for embodiment tag: {embodiment_tag}")
 
-        print(f"Loading model from {model_path}...")
+        self.log.info(f"Loading model from {model_path}...")
         self.model = Gr00tN1d6.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
@@ -322,13 +505,14 @@ class FeatureDumper:
         )
         self.model.to(device)
         self.model.eval()
+        self.log.info(f"Model loaded successfully")
 
         # Verify frozen backbone
         backbone_trainable = any(
             p.requires_grad for p in self.model.backbone.parameters()
         )
         if backbone_trainable:
-            print("WARNING: Backbone has trainable parameters. Features may not be reusable!")
+            self.log.warning("Backbone has trainable parameters. Features may not be reusable!")
 
         # Create processor for data loading
         # Pass modality_config so the processor knows about our custom embodiment
@@ -339,7 +523,7 @@ class FeatureDumper:
         self.processor.eval()  # Disable training augmentations
 
         # Create dataset
-        print(f"Loading dataset from {input_dir}...")
+        self.log.info(f"Loading dataset from {input_dir}...")
         self.dataset = ShardedSingleStepDataset(
             dataset_path=input_dir,
             embodiment_tag=self.embodiment_tag,
@@ -378,6 +562,7 @@ class FeatureDumper:
         self.checkpoint_manager = CheckpointManager(
             output_dir=self.output_dir,
             config_hash=self.metadata["config_hash"],
+            logger=self.log,
         )
 
     def _load_modality_config(self, path: str):
@@ -480,7 +665,7 @@ class FeatureDumper:
             },
         }
         self.checkpoint_manager.save(state)
-        print(f"Checkpoint saved: {global_idx}/{total_samples} samples, {current_shard_idx} shards")
+        self.log.info(f"Checkpoint saved: {global_idx}/{total_samples} samples, {current_shard_idx} shards")
 
     def _write_webdataset_sample(self, tar: tarfile.TarFile, idx: int, sample: dict):
         """Write a single sample to a WebDataset tar file."""
@@ -555,15 +740,15 @@ class FeatureDumper:
         self.shutdown_handler.register()
 
         total_samples = sum(self.dataset.shard_lengths)
-        print(f"Dumping features to WebDataset format at {self.output_dir}")
-        print(f"Total samples: {total_samples}")
-        print(f"Shard size: {self.shard_size}")
+        self.log.info(f"Dumping features to WebDataset format at {self.output_dir}")
+        self.log.info(f"Total samples: {total_samples}")
+        self.log.info(f"Shard size: {self.shard_size}")
 
         # Initialize state (fresh start or resume)
         if resume_checkpoint is not None:
             start_dataset_shard, start_batch, current_shard_idx, global_idx = \
                 self._compute_resume_state(resume_checkpoint)
-            print(f"Resuming from: global_idx={global_idx}, output_shard={current_shard_idx}")
+            self.log.info(f"Resuming from: global_idx={global_idx}, output_shard={current_shard_idx}")
         else:
             start_dataset_shard = 0
             start_batch = 0
@@ -574,12 +759,15 @@ class FeatureDumper:
             meta_path = self.output_dir / "metadata.json"
             with open(meta_path, "w") as f:
                 json.dump(self.metadata, f, indent=2)
-            print(f"Saved metadata to {meta_path}")
+            self.log.info(f"Saved metadata to {meta_path}")
 
         current_tar = None
         samples_in_shard = 0
         shards_since_checkpoint = 0
         last_completed_shard_global_idx = global_idx
+
+        # Start performance tracking
+        self.perf.start()
 
         # Process all dataset shards
         pbar = tqdm(total=total_samples, initial=global_idx, desc="Extracting features")
@@ -601,6 +789,9 @@ class FeatureDumper:
                     batch_end = min(batch_start + self.batch_size, len(shard_data))
                     batch = shard_data[batch_start:batch_end]
 
+                    # Track batch timing
+                    self.perf.start_batch()
+
                     # Collate and extract
                     collated = self.collate_fn(batch)
                     extracted = self.extract_features(collated)
@@ -612,12 +803,13 @@ class FeatureDumper:
                         if current_tar is None or samples_in_shard >= self.shard_size:
                             if current_tar is not None:
                                 current_tar.close()
+                                self.perf.end_shard()
                                 shards_since_checkpoint += 1
 
                                 # Update tracking for checkpoint
                                 last_completed_shard_global_idx = global_idx
 
-                                # Save checkpoint periodically
+                                # Save checkpoint and log metrics periodically
                                 if shards_since_checkpoint >= self.checkpoint_interval:
                                     self._save_checkpoint(
                                         global_idx=global_idx,
@@ -625,6 +817,13 @@ class FeatureDumper:
                                         dataset_shard_idx=shard_idx,
                                         batch_start=batch_start,
                                         total_samples=total_samples,
+                                    )
+                                    # Log performance metrics
+                                    self.log.log_metrics(
+                                        samples_processed=global_idx,
+                                        total_samples=total_samples,
+                                        elapsed=self.perf.get_elapsed(),
+                                        shards=current_shard_idx,
                                     )
                                     shards_since_checkpoint = 0
 
@@ -649,6 +848,9 @@ class FeatureDumper:
                         samples_in_shard += 1
                         pbar.update(1)
 
+                    # End batch timing
+                    self.perf.end_batch(batch_size_actual)
+
                     # Free memory
                     del extracted
                     torch.cuda.empty_cache()
@@ -659,7 +861,7 @@ class FeatureDumper:
 
         except KeyboardInterrupt:
             # Graceful shutdown: close current tar and save checkpoint
-            print("\nShutdown: saving checkpoint...")
+            self.log.warning("Shutdown: saving checkpoint...")
             if current_tar is not None:
                 current_tar.close()
                 # The current shard is incomplete, so checkpoint points to start of it
@@ -674,7 +876,7 @@ class FeatureDumper:
             )
             pbar.close()
             self.shutdown_handler.restore()
-            print("Checkpoint saved. Run with --resume to continue.")
+            self.log.info("Checkpoint saved. Run with --resume to continue.")
             sys.exit(130)  # Standard exit code for SIGINT
 
         finally:
@@ -701,8 +903,14 @@ class FeatureDumper:
         # Remove checkpoint on success
         self.checkpoint_manager.delete()
 
-        print(f"\nDone! Wrote {global_idx} samples to {current_shard_idx} shards")
-        print(f"Index: {index_path}")
+        # Log final summary with performance metrics
+        self.log.log_final_summary(
+            total_samples=global_idx,
+            total_shards=current_shard_idx,
+            total_time=self.perf.get_elapsed(),
+            peak_throughput=self.perf.get_peak_throughput(),
+        )
+        self.log.info(f"Index: {index_path}")
 
     def dump_lmdb(self):
         """Dump features to LMDB format."""
@@ -711,10 +919,10 @@ class FeatureDumper:
         except ImportError:
             raise ImportError("LMDB not installed. Run: pip install lmdb")
 
-        print(f"Dumping features to LMDB format at {self.output_dir}")
+        self.log.info(f"Dumping features to LMDB format at {self.output_dir}")
 
         total_samples = sum(self.dataset.shard_lengths)
-        print(f"Total samples: {total_samples}")
+        self.log.info(f"Total samples: {total_samples}")
 
         # Estimate map size (1MB per sample, 50% overhead)
         map_size = int(total_samples * 1.5 * 1024 * 1024)
@@ -783,7 +991,7 @@ class FeatureDumper:
         with open(index_path, "w") as f:
             json.dump(index, f, indent=2)
 
-        print(f"\nDone! Wrote {global_idx} samples to LMDB")
+        self.log.info(f"Done! Wrote {global_idx} samples to LMDB")
 
     def run(self, resume_checkpoint: dict | None = None):
         """Run the feature dumping process."""
@@ -791,7 +999,7 @@ class FeatureDumper:
             self.dump_webdataset(resume_checkpoint=resume_checkpoint)
         elif self.output_format == "lmdb":
             if resume_checkpoint is not None:
-                print("WARNING: LMDB format does not support resumption. Starting fresh.")
+                self.log.warning("LMDB format does not support resumption. Starting fresh.")
             self.dump_lmdb()
         else:
             raise ValueError(f"Unknown format: {self.output_format}")
@@ -884,6 +1092,19 @@ def main():
         default=5,
         help="Save checkpoint every N completed shards (default: 5)",
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level for console output (default: INFO)",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Custom log file path (default: output_dir/dumper_YYYYMMDD_HHMMSS.log)",
+    )
 
     args = parser.parse_args()
 
@@ -927,33 +1148,31 @@ def main():
         num_workers=args.num_workers,
         device=args.device,
         checkpoint_interval=args.checkpoint_interval,
+        log_level=args.log_level,
+        log_file=args.log_file,
     )
 
     # Load and validate checkpoint if resuming
     resume_checkpoint = None
     if args.resume and checkpoint_path.exists():
-        print("Loading checkpoint...")
+        dumper.log.info("Loading checkpoint...")
         resume_checkpoint = dumper.checkpoint_manager.load()
         if resume_checkpoint is None:
-            print("ERROR: Checkpoint validation failed. Use --force-restart to start fresh.")
+            dumper.log.error("Checkpoint validation failed. Use --force-restart to start fresh.")
             sys.exit(1)
 
         # Validate existing shards
         expected_shards = resume_checkpoint["completed_shards"]
-        print(f"Validating {expected_shards} existing shards...")
+        dumper.log.info(f"Validating {expected_shards} existing shards...")
         if not dumper.checkpoint_manager.validate_existing_shards(expected_shards):
-            print("ERROR: Some shard files are missing or corrupted.")
+            dumper.log.error("Some shard files are missing or corrupted.")
             sys.exit(1)
 
         # Clean up any incomplete shards
         dumper.checkpoint_manager.cleanup_incomplete_shards(expected_shards)
-        print(f"Resuming from {resume_checkpoint['last_complete_global_idx']} samples, {expected_shards} shards")
+        dumper.log.info(f"Resuming from {resume_checkpoint['last_complete_global_idx']} samples, {expected_shards} shards")
 
-    start_time = time.time()
     dumper.run(resume_checkpoint=resume_checkpoint)
-    elapsed = time.time() - start_time
-
-    print(f"\nTotal time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
 
 
 if __name__ == "__main__":
