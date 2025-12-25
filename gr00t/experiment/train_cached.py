@@ -236,27 +236,31 @@ def run_cached_training(
                 steps_per_sec = 1.0 / avg_step_time
                 samples_per_sec = steps_per_sec * per_device_batch_size
             else:
-                avg_step_time = 0
-                steps_per_sec = 0
-                samples_per_sec = 0
+                # Skip throughput metrics during warmup (would be 0, dominating charts)
+                steps_per_sec = None
+                samples_per_sec = None
 
             if global_rank == 0:
                 log_dict = {
                     "loss": avg_loss,
                     "lr": scheduler.get_last_lr()[0],
                     "step": global_step,
-                    "steps_per_sec": steps_per_sec,
-                    "samples_per_sec": samples_per_sec,
                 }
+                # Only log throughput after warmup to avoid zeros in charts
+                if steps_per_sec is not None:
+                    log_dict["steps_per_sec"] = steps_per_sec
+                    log_dict["samples_per_sec"] = samples_per_sec
 
                 if config.training.use_wandb:
                     wandb.log(log_dict, step=global_step)
 
-                pbar.set_postfix(
-                    loss=f"{avg_loss:.4f}",
-                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
-                    steps_s=f"{steps_per_sec:.1f}",
-                )
+                postfix = {
+                    "loss": f"{avg_loss:.4f}",
+                    "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                }
+                if steps_per_sec is not None:
+                    postfix["steps_s"] = f"{steps_per_sec:.1f}"
+                pbar.set_postfix(**postfix)
 
         # Save checkpoint
         if global_step % save_steps == 0 and global_rank == 0:
