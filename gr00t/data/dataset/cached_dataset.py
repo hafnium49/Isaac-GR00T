@@ -108,6 +108,22 @@ class CachedFeatureDataset(Dataset):
         if len(self.shard_files) == 0:
             raise FileNotFoundError(f"No shard files found in {self.cached_path}")
 
+        # Validate cache completion
+        completed = self.index.get("completed", False)
+        if not completed:
+            raise ValueError(
+                f"Cache at {self.cached_path} is not complete. "
+                f"Run ./groot/dump_features.sh or use --resume to continue an interrupted run."
+            )
+
+        # Validate shard count matches index
+        actual_shards = len(self.shard_files)
+        if actual_shards < self.num_shards:
+            raise ValueError(
+                f"Incomplete cache: found {actual_shards}/{self.num_shards} shards. "
+                f"Run ./groot/dump_features.sh --resume to complete the feature extraction."
+            )
+
         # Cache for loaded shards
         self._shard_cache = {}
         self._cache_max_shards = 2  # Keep at most 2 shards in memory
@@ -301,6 +317,23 @@ class CachedWebDatasetIterable(IterableDataset):
             self.cached_path.glob("shard-*.tar"),
             key=lambda x: int(x.stem.split("-")[1]),
         )
+
+        # Validate cache completion
+        completed = self.index.get("completed", False)
+        if not completed:
+            raise ValueError(
+                f"Cache at {cached_path} is not complete. "
+                f"Run ./groot/dump_features.sh or use --resume to continue an interrupted run."
+            )
+
+        # Validate shard count matches index
+        expected_shards = self.index.get("num_shards", 0)
+        actual_shards = len(self.shard_files)
+        if actual_shards < expected_shards:
+            raise ValueError(
+                f"Incomplete cache: found {actual_shards}/{expected_shards} shards. "
+                f"Run ./groot/dump_features.sh --resume to complete the feature extraction."
+            )
 
     def __iter__(self) -> Iterator[dict]:
         """Iterate through all shards and samples."""

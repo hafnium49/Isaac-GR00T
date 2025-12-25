@@ -895,6 +895,7 @@ class FeatureDumper:
             "shard_size": self.shard_size,
             "format": "webdataset",
             "metadata": self.metadata,
+            "completed": True,  # Mark successful completion for cache validation
         }
         index_path = self.output_dir / "index.json"
         with open(index_path, "w") as f:
@@ -986,6 +987,7 @@ class FeatureDumper:
             "num_samples": global_idx,
             "format": "lmdb",
             "metadata": self.metadata,
+            "completed": True,  # Mark successful completion for cache validation
         }
         index_path = self.output_dir / "index.json"
         with open(index_path, "w") as f:
