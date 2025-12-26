@@ -267,9 +267,8 @@ def run_cached_training(
             checkpoint_dir = output_dir / f"checkpoint-{global_step}"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-            # Save model (avoid save_pretrained which triggers DeepSpeed nvcc check)
-            model.config.save_pretrained(checkpoint_dir)
-            torch.save(model.state_dict(), checkpoint_dir / "pytorch_model.bin")
+            # Save model
+            model.save_pretrained(checkpoint_dir)
 
             # Save training state
             torch.save(
@@ -300,11 +299,10 @@ def run_cached_training(
             logging.info(f"  Throughput: {1.0/avg_step_time:.1f} steps/sec")
             logging.info(f"  Throughput: {per_device_batch_size/avg_step_time:.1f} samples/sec")
 
-        # Save final model (avoid save_pretrained which triggers DeepSpeed nvcc check)
+        # Save final model
         final_dir = output_dir / "final"
         final_dir.mkdir(parents=True, exist_ok=True)
-        model.config.save_pretrained(final_dir)
-        torch.save(model.state_dict(), final_dir / "pytorch_model.bin")
+        model.save_pretrained(final_dir)
         logging.info(f"Saved final model to {final_dir}")
 
         if config.training.use_wandb:
