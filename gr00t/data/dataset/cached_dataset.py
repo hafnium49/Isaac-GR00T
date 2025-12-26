@@ -108,21 +108,25 @@ class CachedFeatureDataset(Dataset):
         if len(self.shard_files) == 0:
             raise FileNotFoundError(f"No shard files found in {self.cached_path}")
 
-        # Validate cache completion
-        completed = self.index.get("completed", False)
-        if not completed:
-            raise ValueError(
-                f"Cache at {self.cached_path} is not complete. "
-                f"Run ./groot/dump_features.sh or use --resume to continue an interrupted run."
-            )
-
-        # Validate shard count matches index
+        # Validate cache completion (backward-compatible with legacy caches)
+        completed = self.index.get("completed", None)  # None = legacy cache (no flag)
         actual_shards = len(self.shard_files)
-        if actual_shards < self.num_shards:
+
+        if completed is False:
+            # Explicitly marked as incomplete (interrupted dump)
+            raise ValueError(
+                f"Cache at {self.cached_path} is marked as incomplete. "
+                f"Run ./groot/dump_features.sh --resume to complete."
+            )
+        elif actual_shards < self.num_shards:
+            # Shards missing (regardless of completed flag)
             raise ValueError(
                 f"Incomplete cache: found {actual_shards}/{self.num_shards} shards. "
                 f"Run ./groot/dump_features.sh --resume to complete the feature extraction."
             )
+        elif completed is None and actual_shards == self.num_shards:
+            # Legacy cache without completed flag but shards match - allow with warning
+            print(f"INFO: Legacy cache format (no 'completed' flag). Using {actual_shards} shards.")
 
         # Cache for loaded shards
         self._shard_cache = {}
@@ -318,22 +322,26 @@ class CachedWebDatasetIterable(IterableDataset):
             key=lambda x: int(x.stem.split("-")[1]),
         )
 
-        # Validate cache completion
-        completed = self.index.get("completed", False)
-        if not completed:
-            raise ValueError(
-                f"Cache at {cached_path} is not complete. "
-                f"Run ./groot/dump_features.sh or use --resume to continue an interrupted run."
-            )
-
-        # Validate shard count matches index
+        # Validate cache completion (backward-compatible with legacy caches)
+        completed = self.index.get("completed", None)  # None = legacy cache (no flag)
         expected_shards = self.index.get("num_shards", 0)
         actual_shards = len(self.shard_files)
-        if actual_shards < expected_shards:
+
+        if completed is False:
+            # Explicitly marked as incomplete (interrupted dump)
+            raise ValueError(
+                f"Cache at {cached_path} is marked as incomplete. "
+                f"Run ./groot/dump_features.sh --resume to complete."
+            )
+        elif actual_shards < expected_shards:
+            # Shards missing (regardless of completed flag)
             raise ValueError(
                 f"Incomplete cache: found {actual_shards}/{expected_shards} shards. "
                 f"Run ./groot/dump_features.sh --resume to complete the feature extraction."
             )
+        elif completed is None and actual_shards == expected_shards:
+            # Legacy cache without completed flag but shards match - allow with warning
+            print(f"INFO: Legacy cache format (no 'completed' flag). Using {actual_shards} shards.")
 
     def __iter__(self) -> Iterator[dict]:
         """Iterate through all shards and samples."""
