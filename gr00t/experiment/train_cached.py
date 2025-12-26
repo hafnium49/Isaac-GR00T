@@ -267,8 +267,9 @@ def run_cached_training(
             checkpoint_dir = output_dir / f"checkpoint-{global_step}"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-            # Save model
-            model.save_pretrained(checkpoint_dir)
+            # Save model (avoid save_pretrained which triggers DeepSpeed nvcc check)
+            model.config.save_pretrained(checkpoint_dir)
+            torch.save(model.state_dict(), checkpoint_dir / "pytorch_model.bin")
 
             # Save training state
             torch.save(
